@@ -6,7 +6,8 @@ import tempfile
 from io import BytesIO
 from PIL import Image as PILImage # Renamed to avoid conflict with chutes.Image
 from fastapi import UploadFile, File, Form # For FastAPI specific type hints
-from fastapi.responses import StreamingResponse
+import base64
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import List, Literal, Optional, Callable, Union
 from loguru import logger
@@ -71,7 +72,7 @@ predict = Chute(
     image=image,
     node_selector=NodeSelector(
         gpu_count=1,
-        min_vram_gb_per_gpu=16
+        min_vram_gb_per_gpu=24
     )
 )
 
@@ -138,13 +139,14 @@ async def initialize(self):
     output_content_type="application/zip",
     pass_chute=True, # To access self.pipeline etc.
     input_schema=TrellisRequest,
+    stream=False,
 )
 async def generate(
     self,
     params: TrellisRequest,
     # For TrellisRequest Pydantic model:
     # params: TrellisRequest (if sending JSON payload + file)
-) -> StreamingResponse:
+) -> JSONResponse:
     
     seed = params.seed
     formats = []
@@ -165,17 +167,9 @@ async def generate(
         "texture_size": texture_size,
     }
     logger.info(f"Received generation request with params: {params_dict}")
-
-    try:                    
-        image_bytes = base64.b64decode(image_b64)
-        input_image = PILImage.open(BytesIO(image_bytes))
-    except Exception as e:
-        logger.error(f"Error reading uploaded image: {e}")
-        return StreamingResponse(
-            status_code=400,
-            content=iter([b'{"error": "Invalid image file"}']),
-            media_type="application/json"
-        )
+                  
+    image_bytes = base64.b64decode(image_b64)
+    input_image = PILImage.open(BytesIO(image_bytes))
 
     with tempfile.TemporaryDirectory() as temp_dir:
         logger.info(f"Processing image in temporary directory: {temp_dir}")
@@ -249,11 +243,7 @@ async def generate(
 
             if not output_files_generated:
                 logger.warning("No output files were generated based on formats or pipeline results.")
-                return StreamingResponse(
-                    status_code=404, # Or 200 with empty content
-                    content=iter([b'{"message": "No output files generated for the given formats or inputs."}']),
-                    media_type="application/json"
-                )
+                raise Exception("No valid output formats were specified or generated.")
 
             # Create a ZIP file in memory
             zip_io = BytesIO()
@@ -263,18 +253,24 @@ async def generate(
             zip_io.seek(0)
             logger.info(f"Successfully zipped {len(output_files_generated)} files.")
 
-            return StreamingResponse(
-                iter([zip_io.getvalue()]), # iter() for StreamingResponse
-                media_type="application/zip",
-                headers={"Content-Disposition": f"attachment; filename={base_filename}_outputs.zip"}
-            )
+            zip_bytes = zip_io.getvalue()
+            zip_b64 = base64.b64encode(zip_bytes).decode('utf-8')
+
+            return JSONResponse(
+                content={
+                    "content_type": "application/zip",
+                    "status": "success",
+                    "bytes": zip_b64,
+                    "filename": f"{base_filename}_outputs.zip"
+                },
+    )
 
         except Exception as e:
             logger.exception("Error during Trellis pipeline execution or file processing:")
             # Return error as JSON for client to parse
             error_payload = json.dumps({"error": "Processing error", "detail": str(e)})
-            return StreamingResponse(
-                iter([error_payload.encode()]),
-                status_code=500, # Internal Server Error
+            raise Exception(
+                status_code=500,
+                content=iter([error_payload.encode('utf-8')]),
                 media_type="application/json"
             )
