@@ -4,7 +4,6 @@ import uuid
 import zipfile
 import tempfile
 from io import BytesIO
-from PIL import Image as PILImage # Renamed to avoid conflict with chutes.Image
 from fastapi import UploadFile, File, Form # For FastAPI specific type hints
 import base64
 from fastapi.responses import JSONResponse
@@ -31,8 +30,13 @@ image = (
     readme=readme,
     )
     .from_base("parachutes/base-python:3.10.17")
+    .set_user("root")
+    .run_command("apt update")
+    .apt_install([
+        'aria2'
+    ])
+    .set_user("chutes")
     .run_command("pip install xformers==0.0.27.post2 torch==2.4.0+cu121 torchvision==0.19.0+cu121 --index-url https://download.pytorch.org/whl/cu121")
-    .run_command("git clone --recurse-submodules https://github.com/microsoft/TRELLIS.git /tmp/trellis")
     .run_command("pip install pillow imageio imageio-ffmpeg tqdm easydict opencv-python-headless scipy ninja rembg onnxruntime trimesh open3d xatlas pyvista pymeshfix igraph transformers")
     .run_command("pip install git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8")
     .run_command("mkdir -p /tmp/extensions && cd /tmp/extensions &&  git clone https://github.com/NVlabs/nvdiffrast.git /tmp/extensions/nvdiffrast &&  pip install /tmp/extensions/nvdiffrast")
@@ -50,7 +54,9 @@ class TrellisRequest(BaseModel):
     texture_size: Optional[int] = Field(
         1024, ge=256, le=4096, description="Size of the texture for GLB export."
     )
-    image_b64: str
+    image_urls: List[str] = Field(
+        description="List of image URLs to process."
+    )
     gaussian: Optional[bool] = Field(
         True, description="Whether to generate Gaussian Splat output."
     )
@@ -59,6 +65,10 @@ class TrellisRequest(BaseModel):
     )
     mesh: Optional[bool] = Field(
         True, description="Whether to generate Mesh output."
+    )
+    multiimage_algo: Optional[Literal["multidiffusion", "stochastic"]] = Field(
+        "stochastic",
+        description="Algorithm for multi-image generation, used if more than one image_url is provided."
     )
 
 
@@ -81,6 +91,9 @@ async def initialize(self):
     """
     Load the classification pipeline and perform a warmup.
     """
+
+    from PIL import Image as PILImage # Renamed to avoid conflict with chutes.Image
+
     logger.info("Setting environment variables for Trellis...")
     # These might be better in the Dockerfile ENV,
     # but setting here ensures they are active for this process.
@@ -127,6 +140,10 @@ async def initialize(self):
     )
     logger.info("Pipeline warmup completed.")
 
+    self.PILImage = PILImage  # Store PIL.Image for later use
+
+    os.makedirs('tmp', exist_ok=True)  # Ensure tmp directory exists for file operations
+
 
 
 @predict.cord(
@@ -147,6 +164,7 @@ async def generate(
     # For TrellisRequest Pydantic model:
     # params: TrellisRequest (if sending JSON payload + file)
 ) -> JSONResponse:
+    run_id = str(uuid.uuid4())[:8]
     
     seed = params.seed
     formats = []
@@ -159,7 +177,9 @@ async def generate(
 
     simplify = params.simplify
     texture_size = params.texture_size
-    image_b64 = params.image_b64
+    image_urls = params.image_urls
+
+
     params_dict = {
         "seed": seed,
         "formats": formats,
@@ -167,14 +187,32 @@ async def generate(
         "texture_size": texture_size,
     }
     logger.info(f"Received generation request with params: {params_dict}")
-                  
-    image_bytes = base64.b64decode(image_b64)
-    input_image = PILImage.open(BytesIO(image_bytes))
+    logger.info(f"Processing {len(image_urls)} image URLs...")
+
 
     with tempfile.TemporaryDirectory() as temp_dir:
         logger.info(f"Processing image in temporary directory: {temp_dir}")
         output_files_generated = []
+        input_images = []
 
+        for idx, url in enumerate(image_urls):
+            image_path = os.path.join(temp_dir, f"{idx}.png")
+            logger.info(f"Downloading image {idx + 1}/{len(image_urls)} from {url}")
+            # Using os.system for simplicity as in the original code
+            result = os.system(f"aria2c -x 16 -s 16 {url} -d {temp_dir} -o {os.path.basename(image_path)}")
+            if result == 0 and os.path.exists(image_path):
+                try:
+                    input_images.append(self.PILImage.open(image_path))
+                except Exception as e:
+                    logger.error(f"Failed to open downloaded image {image_path}: {e}")
+            else:
+                logger.error(f"Failed to download image from {url}. aria2c exit code: {result}")
+
+        if not input_images:
+            return JSONResponse(
+                content={"error": "Image processing failed", "detail": "Could not download or open any of the provided images."},
+                status_code=400,
+            )
         try:
             # Run the pipeline
             logger.info("Running Trellis pipeline...")
@@ -186,13 +224,24 @@ async def generate(
             #         "cfg_strength": params.sparse_structure_sampler_cfg_strength,
             #     } # etc.
 
-            pipeline_outputs = self.pipeline.run(
-                input_image,
-                seed=seed,
-                formats=formats,
-                # **optional_params
-            )
+            if len(input_images) > 1:
+                logger.info(f"Using multi-image pipeline with algorithm: {params.multiimage_algo}")
+                pipeline_outputs = self.pipeline.run_multi_image(
+                    input_images,
+                    seed=seed,
+                    formats=formats,
+                    mode=params.multiimage_algo
+                )
+            else:
+                logger.info("Using single-image pipeline")
+                pipeline_outputs = self.pipeline.run(
+                    input_images[0],
+                    seed=seed,
+                    formats=formats,
+                    # **optional_params
+                )
             logger.info("Pipeline run completed. Processing outputs...")
+
 
             # Render and save outputs
             base_filename = str(uuid.uuid4())
@@ -269,8 +318,7 @@ async def generate(
             logger.exception("Error during Trellis pipeline execution or file processing:")
             # Return error as JSON for client to parse
             error_payload = json.dumps({"error": "Processing error", "detail": str(e)})
-            raise Exception(
+            return JSONResponse(
+               content=iter([error_payload.encode('utf-8')]),
                 status_code=500,
-                content=iter([error_payload.encode('utf-8')]),
-                media_type="application/json"
             )
