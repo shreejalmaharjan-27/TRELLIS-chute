@@ -36,7 +36,7 @@ image = (
     .run_command("pip install pillow imageio imageio-ffmpeg tqdm easydict opencv-python-headless scipy ninja rembg onnxruntime trimesh open3d xatlas pyvista pymeshfix igraph transformers")
     .run_command("pip install git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8")
     .run_command("mkdir -p /tmp/extensions && cd /tmp/extensions &&  git clone https://github.com/NVlabs/nvdiffrast.git /tmp/extensions/nvdiffrast &&  pip install /tmp/extensions/nvdiffrast")
-    .run_command("mkdir -p /tmp/extensions &&  git clone https://github.com/autonomousvision/mip-splatting.git /tmp/extensions/mip-splatting &&  TORCH_CUDA_ARCH_LIST='6.0;6.1;7.0;7.5;8.0;8.6;8.9;9.0' pip install /tmp/extensions/mip-splatting/submodules/diff-gaussian-rasterization/")
+    .run_command("mkdir -p /tmp/extensions &&  git clone https://github.com/autonomousvision/mip-splatting.git /tmp/extensions/mip-splatting && TORCH_CUDA_ARCH_LIST='6.0;6.1;7.0;7.5;8.0;8.6;8.9;9.0' pip install --no-build-isolation /tmp/extensions/mip-splatting/submodules/diff-gaussian-rasterization/")
     .run_command("pip install spconv-cu124")
     .run_command("pip install kaolin -f https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.5.0_cu124.html")
     .run_command("pip install xformers==0.0.27.post2 torch==2.4.0+cu121 torchvision==0.19.0+cu121 --index-url https://download.pytorch.org/whl/cu121")
